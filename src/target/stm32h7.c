@@ -30,11 +30,12 @@
 #include "target_internal.h"
 #include "cortexm.h"
 
-static bool stm32h7_cmd_erase_mass(target *t);
+static bool stm32h7_cmd_erase_mass(target *t, int argc, const char **argv);
 /* static bool stm32h7_cmd_option(target *t, int argc, char *argv[]); */
-static bool stm32h7_uid(target *t);
-static bool stm32h7_crc(target *t);
+static bool stm32h7_uid(target *t, int argc, const char **argv);
+static bool stm32h7_crc(target *t, int argc, const char **argv);
 static bool stm32h7_cmd_psize(target *t, int argc, char *argv[]);
+static bool stm32h7_cmd_rev(target *t, int argc, const char **argv);
 
 const struct command_s stm32h7_cmd_list[] = {
 	{"erase_mass", (cmd_handler)stm32h7_cmd_erase_mass,
@@ -45,6 +46,8 @@ const struct command_s stm32h7_cmd_list[] = {
 	 "Configure flash write parallelism: (x8|x16|x32|x64(default))"},
 	{"uid", (cmd_handler)stm32h7_uid, "Print unique device ID"},
 	{"crc", (cmd_handler)stm32h7_crc, "Print CRC of both banks"},
+	{"revision", (cmd_handler)stm32h7_cmd_rev,
+	 "Returns the Device ID and Revision"},
 	{NULL, NULL, NULL}
 };
 
@@ -126,7 +129,9 @@ enum stm32h7_regs
 #define OPTKEY2 0x4C5D6E7F
 
 #define DBGMCU_IDCODE	0x5c001000
-/* Access via 0xe00e1000 does not show device! */
+/* Access from processor address space.
+ * Access via the APB-D is at 0xe00e1000 */
+#define DBGMCU_IDC		(DBGMCU_IDCODE + 0)
 #define DBGMCU_CR		(DBGMCU_IDCODE + 4)
 #define DBGSLEEP_D1		(1 << 0)
 #define DBGSTOP_D1		(1 << 1)
@@ -157,7 +162,14 @@ static void stm32h7_add_flash(target *t,
                               uint32_t addr, size_t length, size_t blocksize)
 {
 	struct stm32h7_flash *sf = calloc(1, sizeof(*sf));
-	struct target_flash *f =  &sf->f;
+	struct target_flash *f;
+
+	if (!sf) {			/* calloc failed: heap exhaustion */
+		DEBUG("calloc: failed in %s\n", __func__);
+		return;
+	}
+
+	f = &sf->f;
 	f->start = addr;
 	f->length = length;
 	f->blocksize = blocksize;
@@ -172,31 +184,62 @@ static void stm32h7_add_flash(target *t,
 	target_add_flash(t, f);
 }
 
-bool stm32h7_probe(target *t)
+static bool stm32h7_attach(target *t)
 {
-	uint32_t idcode = target_mem_read32(t, DBGMCU_IDCODE) & 0xFFF;
-	if (idcode == ID_STM32H74x) {
-		/* RM0433 Rev 4 is not really clear, what bits are needed.
-		 * Set all possible relevant bits for now. */
-		target_mem_write32(t, DBGMCU_CR, DBGSLEEP_D1 | D1DBGCKEN);
-		t->idcode = idcode;
-		t->driver = stm32h74_driver_str;
-		target_add_commands(t, stm32h7_cmd_list, stm32h74_driver_str);
-		target_add_ram(t, 0x00000000, 0x10000); /* ITCM Ram,  64 k */
-		target_add_ram(t, 0x20000000, 0x20000); /* DTCM Ram, 128 k */
-		target_add_ram(t, 0x24000000, 0x80000); /* AXI Ram,  512 k */
-		target_add_ram(t, 0x30000000, 0x20000); /* AHB SRAM1, 128 k */
-		target_add_ram(t, 0x32000000, 0x20000); /* AHB SRAM2, 128 k */
-		target_add_ram(t, 0x34000000, 0x08000); /* AHB SRAM3,  32 k */
-		target_add_ram(t, 0x38000000, 0x01000); /* AHB SRAM4,  32 k */
-		stm32h7_add_flash(t, 0x8000000, 0x100000, FLASH_SECTOR_SIZE);
-		stm32h7_add_flash(t, 0x8100000, 0x100000, FLASH_SECTOR_SIZE);
+	if (!cortexm_attach(t))
+		return false;
+	/* RM0433 Rev 4 is not really clear, what bits are needed.
+	 * Set all possible relevant bits for now. */
+	uint32_t dbgmcu_cr = target_mem_read32(t, DBGMCU_CR);
+	t->target_storage = dbgmcu_cr;
+	target_mem_write32(t, DBGMCU_CR, DBGSLEEP_D1 | D1DBGCKEN);
 	/* If IWDG runs as HARDWARE watchdog (44.3.4) erase
 	 * will be aborted by the Watchdog and erase fails!
 	 * Setting IWDG_KR to 0xaaaa does not seem to help!*/
-		uint32_t optsr = target_mem_read32(t, FPEC1_BASE + FLASH_OPTSR);
-		if (!(optsr & FLASH_OPTSR_IWDG1_SW))
-			tc_printf(t, "Hardware IWDG running. Expect failure. Set IWDG1_SW!");
+	uint32_t optsr = target_mem_read32(t, FPEC1_BASE + FLASH_OPTSR);
+	if (!(optsr & FLASH_OPTSR_IWDG1_SW))
+		tc_printf(t, "Hardware IWDG running. Expect failure. Set IWDG1_SW!");
+
+	/* Free previously loaded memory map */
+	target_mem_map_free(t);
+
+	/* Add RAM to memory map */
+	target_add_ram(t, 0x00000000, 0x10000); /* ITCM Ram,  64 k */
+	target_add_ram(t, 0x20000000, 0x20000); /* DTCM Ram, 128 k */
+	target_add_ram(t, 0x24000000, 0x80000); /* AXI Ram,  512 k */
+	target_add_ram(t, 0x30000000, 0x20000); /* AHB SRAM1, 128 k */
+	target_add_ram(t, 0x32000000, 0x20000); /* AHB SRAM2, 128 k */
+	target_add_ram(t, 0x34000000, 0x08000); /* AHB SRAM3,  32 k */
+	target_add_ram(t, 0x38000000, 0x01000); /* AHB SRAM4,  32 k */
+
+	/* Add the flash to memory map. */
+	uint32_t flashsize = target_mem_read32(t,  FLASH_SIZE_REG);
+	flashsize &= 0xffff;
+	if (flashsize == 128) { /* H750 has only 128 kByte!*/
+		stm32h7_add_flash(t, 0x8000000, FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE);
+	} else {
+		stm32h7_add_flash(t, 0x8000000, 0x100000, FLASH_SECTOR_SIZE);
+		stm32h7_add_flash(t, 0x8100000, 0x100000, FLASH_SECTOR_SIZE);
+	}
+	return true;
+}
+
+static void stm32h7_detach(target *t)
+{
+	target_mem_write32(t, DBGMCU_CR, t->target_storage);
+	cortexm_detach(t);
+}
+
+bool stm32h7_probe(target *t)
+{
+	ADIv5_AP_t *ap = cortexm_ap(t);
+	uint32_t idcode = (ap->dp->targetid >> 16) & 0xfff;
+	if (idcode == ID_STM32H74x) {
+		t->idcode = idcode;
+		t->driver = stm32h74_driver_str;
+		t->attach = stm32h7_attach;
+		t->detach = stm32h7_detach;
+		target_add_commands(t, stm32h7_cmd_list, stm32h74_driver_str);
 		return true;
 	}
 	return false;
@@ -387,8 +430,10 @@ static bool stm32h7_cmd_erase(target *t, int bank_mask)
 	return result;
 }
 
-static bool stm32h7_cmd_erase_mass(target *t)
+static bool stm32h7_cmd_erase_mass(target *t, int argc, const char **argv)
 {
+	(void)argc;
+	(void)argv;
 	tc_printf(t, "Erasing flash... This may take a few seconds.  ");
 	return stm32h7_cmd_erase(t, 3);
 }
@@ -396,8 +441,10 @@ static bool stm32h7_cmd_erase_mass(target *t)
 /* Print the Unique device ID.
  * Can be reused for other STM32 devices With uid as parameter.
  */
-static bool stm32h7_uid(target *t)
+static bool stm32h7_uid(target *t, int argc, const char **argv)
 {
+	(void)argc;
+	(void)argv;
 	uint32_t uid = 0x1ff1e800;
 	int i;
 	tc_printf(t, "0x");
@@ -440,8 +487,10 @@ static int stm32h7_crc_bank(target *t, uint32_t bank)
 	return 0;
 }
 
-static bool stm32h7_crc(target *t)
+static bool stm32h7_crc(target *t, int argc, const char **argv)
 {
+	(void)argc;
+	(void)argv;
 	if (stm32h7_crc_bank(t, BANK1_START) ) return false;
 	uint32_t crc1 = target_mem_read32(t, FPEC1_BASE + FLASH_CRCDATA);
 	if (stm32h7_crc_bank(t, BANK2_START) ) return false;
@@ -451,6 +500,8 @@ static bool stm32h7_crc(target *t)
 }
 static bool stm32h7_cmd_psize(target *t, int argc, char *argv[])
 {
+	(void)argc;
+	(void)argv;
 	if (argc == 1) {
 		enum align psize = ALIGN_DWORD;
 		for (struct target_flash *f = t->flash; f; f = f->next) {
@@ -482,5 +533,47 @@ static bool stm32h7_cmd_psize(target *t, int argc, char *argv[])
 			}
 		}
 	}
+	return true;
+}
+
+static const struct stm32h7xx_rev {
+	uint32_t rev_id;
+	char revision;
+} stm32h7xx_revisions[] = {
+	{ 0x1000, 'A' },
+	{ 0x1001, 'Z' },
+	{ 0x1003, 'Y' },
+	{ 0x2001, 'X' },
+	{ 0x2003, 'V' }
+};
+static bool stm32h7_cmd_rev(target *t, int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+	/* DBGMCU identity code register */
+	uint32_t dbgmcu_idc = target_mem_read32(t, DBGMCU_IDC);
+	uint16_t rev_id = (dbgmcu_idc >> 16) & 0xFFFF;
+	uint16_t dev_id = dbgmcu_idc & 0xFFF;
+
+	/* Print device */
+	switch (dev_id) {
+	case 0x450:
+		tc_printf(t, "STM32H742/743/753/750\n");
+		break;
+	default:
+		tc_printf(t, "Unknown STM32H7. This driver may not support it!\n");
+	}
+
+	/* Print revision */
+	char rev = '?';
+	for (size_t i = 0;
+		 i < sizeof(stm32h7xx_revisions)/sizeof(struct stm32h7xx_rev); i++) {
+		/* Check for matching revision */
+		if (stm32h7xx_revisions[i].rev_id == rev_id) {
+			rev = stm32h7xx_revisions[i].revision;
+		}
+	}
+	tc_printf(t, "Revision %c\n", rev);
+
 	return true;
 }

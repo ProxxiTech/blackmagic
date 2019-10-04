@@ -43,29 +43,23 @@ struct command_s {
 	const char *help;
 };
 
-enum assert_srst_t{
-	ASSERT_NEVER = 0,
-	ASSERT_UNTIL_SCAN,
-	ASSERT_UNTIL_ATTACH
-};
-
-static bool cmd_version(void);
-static bool cmd_help(target *t);
+static bool cmd_version(target *t, int argc, char **argv);
+static bool cmd_help(target *t, int argc, char **argv);
 
 static bool cmd_jtag_scan(target *t, int argc, char **argv);
-static bool cmd_swdp_scan(void);
-static bool cmd_targets(void);
-static bool cmd_morse(void);
-static bool cmd_assert_srst(target *t, int argc, const char **argv);
+static bool cmd_swdp_scan(target *t, int argc, char **argv);
+static bool cmd_targets(target *t, int argc, char **argv);
+static bool cmd_morse(target *t, int argc, char **argv);
 static bool cmd_halt_timeout(target *t, int argc, const char **argv);
-static bool cmd_hard_srst(void);
+static bool cmd_connect_srst(target *t, int argc, const char **argv);
+static bool cmd_hard_srst(target *t, int argc, const char **argv);
 #ifdef PLATFORM_HAS_POWER_SWITCH
 static bool cmd_target_power(target *t, int argc, const char **argv);
 #endif
 #ifdef PLATFORM_HAS_TRACESWO
 static bool cmd_traceswo(target *t, int argc, const char **argv);
 #endif
-#ifdef PLATFORM_HAS_DEBUG
+#if defined(PLATFORM_HAS_DEBUG) && !defined(PC_HOSTED)
 static bool cmd_debug_bmp(target *t, int argc, const char **argv);
 #endif
 
@@ -76,8 +70,8 @@ const struct command_s cmd_list[] = {
 	{"swdp_scan", (cmd_handler)cmd_swdp_scan, "Scan SW-DP for devices" },
 	{"targets", (cmd_handler)cmd_targets, "Display list of available targets" },
 	{"morse", (cmd_handler)cmd_morse, "Display morse error message" },
-	{"assert_srst", (cmd_handler)cmd_assert_srst, "Assert SRST until:(never(default)| scan | attach)" },
 	{"halt_timeout", (cmd_handler)cmd_halt_timeout, "Timeout (ms) to wait until Cortex-M is halted: (Default 2000)" },
+	{"connect_srst", (cmd_handler)cmd_connect_srst, "Configure connect under SRST: (enable|disable)" },
 	{"hard_srst", (cmd_handler)cmd_hard_srst, "Force a pulse on the hard SRST line - disconnects target" },
 #ifdef PLATFORM_HAS_POWER_SWITCH
 	{"tpwr", (cmd_handler)cmd_target_power, "Supplies power to the target: (enable|disable)"},
@@ -85,14 +79,14 @@ const struct command_s cmd_list[] = {
 #ifdef PLATFORM_HAS_TRACESWO
 	{"traceswo", (cmd_handler)cmd_traceswo, "Start trace capture [(baudrate) for async swo]" },
 #endif
-#ifdef PLATFORM_HAS_DEBUG
+#if defined(PLATFORM_HAS_DEBUG) && !defined(PC_HOSTED)
 	{"debug_bmp", (cmd_handler)cmd_debug_bmp, "Output BMP \"debug\" strings to the second vcom: (enable|disable)"},
 #endif
 	{NULL, NULL, NULL}
 };
 
-static enum assert_srst_t assert_srst;
-#ifdef PLATFORM_HAS_DEBUG
+bool connect_assert_srst;
+#if defined(PLATFORM_HAS_DEBUG) && !defined(PC_HOSTED)
 bool debug_bmp;
 #endif
 long cortexm_wait_timeout = 2000; /* Timeout to wait for Cortex to react on halt command. */
@@ -128,9 +122,17 @@ int command_process(target *t, char *cmd)
 	return target_command(t, argc, argv);
 }
 
-bool cmd_version(void)
+bool cmd_version(target *t, int argc, char **argv)
 {
+	(void)t;
+	(void)argc;
+	(void)argv;
+#if defined PC_HOSTED
+	gdb_outf("Black Magic Probe, PC-Hosted for " PLATFORM_IDENT
+			 ", Version " FIRMWARE_VERSION "\n");
+#else
 	gdb_outf("Black Magic Probe (Firmware " FIRMWARE_VERSION ") (Hardware Version %d)\n", platform_hwversion());
+#endif
 	gdb_out("Copyright (C) 2015  Black Sphere Technologies Ltd.\n");
 	gdb_out("License GPLv3+: GNU GPL version 3 or later "
 		"<http://gnu.org/licenses/gpl.html>\n\n");
@@ -138,8 +140,10 @@ bool cmd_version(void)
 	return true;
 }
 
-bool cmd_help(target *t)
+bool cmd_help(target *t, int argc, char **argv)
 {
+	(void)argc;
+	(void)argv;
 	const struct command_s *c;
 
 	gdb_out("General commands:\n");
@@ -168,10 +172,8 @@ static bool cmd_jtag_scan(target *t, int argc, char **argv)
 		irlens[argc-1] = 0;
 	}
 
-	if(assert_srst != ASSERT_NEVER)
-		platform_srst_set_val(true);
-	if(assert_srst == ASSERT_UNTIL_SCAN)
-		platform_srst_set_val(false);
+	if(connect_assert_srst)
+		platform_srst_set_val(true); /* will be deasserted after attach */
 
 	int devs = -1;
 	volatile struct exception e;
@@ -192,19 +194,20 @@ static bool cmd_jtag_scan(target *t, int argc, char **argv)
 		gdb_out("JTAG device scan failed!\n");
 		return false;
 	}
-	cmd_targets();
+	cmd_targets(NULL, 0, NULL);
 	morse(NULL, false);
 	return true;
 }
 
-bool cmd_swdp_scan(void)
+bool cmd_swdp_scan(target *t, int argc, char **argv)
 {
+	(void)t;
+	(void)argc;
+	(void)argv;
 	gdb_outf("Target voltage: %s\n", platform_target_voltage());
 
-	if(assert_srst != ASSERT_NEVER)
-		platform_srst_set_val(true);
-	if(assert_srst == ASSERT_UNTIL_SCAN)
-		platform_srst_set_val(false);
+	if(connect_assert_srst)
+		platform_srst_set_val(true); /* will be deasserted after attach */
 
 	int devs = -1;
 	volatile struct exception e;
@@ -226,7 +229,7 @@ bool cmd_swdp_scan(void)
 		return false;
 	}
 
-	cmd_targets();
+	cmd_targets(NULL, 0, NULL);
 	morse(NULL, false);
 	return true;
 
@@ -235,11 +238,16 @@ bool cmd_swdp_scan(void)
 static void display_target(int i, target *t, void *context)
 {
 	(void)context;
-	gdb_outf("%2d   %c  %s\n", i, target_attached(t)?'*':' ', target_driver_name(t));
+	gdb_outf("%2d   %c  %s %s\n", i, target_attached(t)?'*':' ',
+			 target_driver_name(t),
+			 (target_core_name(t)) ? target_core_name(t): "");
 }
 
-bool cmd_targets(void)
+bool cmd_targets(target *t, int argc, char **argv)
 {
+	(void)t;
+	(void)argc;
+	(void)argv;
 	gdb_out("Available Targets:\n");
 	gdb_out("No. Att Driver\n");
 	if (!target_foreach(display_target, NULL)) {
@@ -250,27 +258,50 @@ bool cmd_targets(void)
 	return true;
 }
 
-bool cmd_morse(void)
+bool cmd_morse(target *t, int argc, char **argv)
 {
+	(void)t;
+	(void)argc;
+	(void)argv;
 	if(morse_msg)
 		gdb_outf("%s\n", morse_msg);
 	return true;
 }
 
-static bool cmd_assert_srst(target *t, int argc, const char **argv)
+bool parse_enable_or_disable(const char *s, bool *out) {
+	if (strlen(s) == 0) {
+		gdb_outf("'enable' or 'disable' argument must be provided\n");
+		return false;
+	} else if (!strncmp(s, "enable", strlen(s))) {
+		*out = true;
+		return true;
+	} else if (!strncmp(s, "disable", strlen(s))) {
+		*out = false;
+		return true;
+	} else {
+		gdb_outf("Argument '%s' not recognized as 'enable' or 'disable'\n", s);
+		return false;
+	}
+}
+
+static bool cmd_connect_srst(target *t, int argc, const char **argv)
 {
 	(void)t;
-	if (argc > 1) {
-		if (!strcmp(argv[1], "attach"))
-			assert_srst = ASSERT_UNTIL_ATTACH;
-		else if (!strcmp(argv[1], "scan"))
-			assert_srst = ASSERT_UNTIL_SCAN;
-		else
-			assert_srst = ASSERT_NEVER;
+	bool print_status = false;
+	if (argc == 1) {
+		print_status = true;
+	} else if (argc == 2) {
+		if (parse_enable_or_disable(argv[1], &connect_assert_srst)) {
+			print_status = true;
+		}
+	} else {
+		gdb_outf("Unrecognized command format\n");
 	}
-	gdb_outf("Assert SRST %s\n",
-			 (assert_srst == ASSERT_UNTIL_ATTACH) ? "until attach" :
-			 (assert_srst == ASSERT_UNTIL_SCAN) ? "until scan" : "never");
+
+	if (print_status) {
+		gdb_outf("Assert SRST during connect: %s\n",
+			 connect_assert_srst ? "enabled" : "disabled");
+	}
 	return true;
 }
 
@@ -284,8 +315,11 @@ static bool cmd_halt_timeout(target *t, int argc, const char **argv)
 	return true;
 }
 
-static bool cmd_hard_srst(void)
+static bool cmd_hard_srst(target *t, int argc, const char **argv)
 {
+	(void)t;
+	(void)argc;
+	(void)argv;
 	target_list_free();
 	platform_srst_set_val(true);
 	platform_srst_set_val(false);
@@ -296,11 +330,18 @@ static bool cmd_hard_srst(void)
 static bool cmd_target_power(target *t, int argc, const char **argv)
 {
 	(void)t;
-	if (argc == 1)
+	if (argc == 1) {
 		gdb_outf("Target Power: %s\n",
 			 platform_target_get_power() ? "enabled" : "disabled");
-	else
-		platform_target_set_power(!strncmp(argv[1], "enable", strlen(argv[1])));
+	} else if (argc == 2) {
+		bool want_enable = false;
+		if (parse_enable_or_disable(argv[1], &want_enable)) {
+			platform_target_set_power(want_enable);
+			gdb_outf("%s target power\n", want_enable ? "Enabling" : "Disabling");
+		}
+	} else {
+		gdb_outf("Unrecognized command format\n");
+	}
 	return true;
 }
 #endif
@@ -325,15 +366,25 @@ static bool cmd_traceswo(target *t, int argc, const char **argv)
 }
 #endif
 
-#ifdef PLATFORM_HAS_DEBUG
+#if defined(PLATFORM_HAS_DEBUG) && !defined(PC_HOSTED)
 static bool cmd_debug_bmp(target *t, int argc, const char **argv)
 {
 	(void)t;
-	if (argc > 1) {
-		debug_bmp = !strcmp(argv[1], "enable");
+	bool print_status = false;
+	if (argc == 1) {
+		print_status = true;
+	} else if (argc == 2) {
+		if (parse_enable_or_disable(argv[1], &debug_bmp)) {
+			print_status = true;
+		}
+	} else {
+		gdb_outf("Unrecognized command format\n");
 	}
-	gdb_outf("Debug mode is %s\n",
-		 debug_bmp ? "enabled" : "disabled");
+
+	if (print_status) {
+		gdb_outf("Debug mode is %s\n",
+			 debug_bmp ? "enabled" : "disabled");
+	}
 	return true;
 }
 #endif

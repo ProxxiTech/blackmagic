@@ -5,7 +5,8 @@
  * Written by Gareth McMullin <gareth@blacksphere.co.nz>
  *
  * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
+ * it under tSchreibe Objekte: 100% (21/21), 3.20 KiB | 3.20 MiB/s, Fertig.
+he terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
@@ -31,6 +32,8 @@
 #include "target.h"
 #include "target_internal.h"
 #include "cortexm.h"
+#include "platform.h"
+#include "command.h"
 
 #include <unistd.h>
 
@@ -50,6 +53,8 @@ const struct command_s cortexm_cmd_list[] = {
 static void cortexm_regs_read(target *t, void *data);
 static void cortexm_regs_write(target *t, const void *data);
 static uint32_t cortexm_pc_read(target *t);
+ssize_t cortexm_reg_read(target *t, int reg, void *data, size_t max);
+ssize_t cortexm_reg_write(target *t, int reg, const void *data, size_t max);
 
 static void cortexm_reset(target *t);
 static enum target_halt_reason cortexm_halt_poll(target *t, target_addr *watch);
@@ -239,17 +244,10 @@ static void cortexm_priv_free(void *priv)
 
 static bool cortexm_forced_halt(target *t)
 {
-	uint32_t start_time = platform_time_ms();
+	target_halt_request(t);
 	platform_srst_set_val(false);
-	/* Wait until SRST is released.*/
-	while (platform_time_ms() < start_time + 2000) {
-		if (!platform_srst_get_val())
-			break;
-	}
-	if (platform_srst_get_val())
-		return false;
 	uint32_t dhcsr = 0;
-	start_time = platform_time_ms();
+	uint32_t start_time = platform_time_ms();
 	/* Try hard to halt the target. STM32F7 in  WFI
 	   needs multiple writes!*/
 	while (platform_time_ms() < start_time + cortexm_wait_timeout) {
@@ -264,13 +262,23 @@ static bool cortexm_forced_halt(target *t)
 	return true;
 }
 
-bool cortexm_probe(ADIv5_AP_t *ap)
+bool cortexm_probe(ADIv5_AP_t *ap, bool forced)
 {
 	target *t;
 
 	t = target_new();
+	if (!t) {
+		return false;
+	}
+
 	adiv5_ap_ref(ap);
+	uint32_t identity = ap->idr & 0xff;
 	struct cortexm_priv *priv = calloc(1, sizeof(*priv));
+	if (!priv) {			/* calloc failed: heap exhaustion */
+		DEBUG("calloc: failed in %s\n", __func__);
+		return false;
+	}
+
 	t->priv = priv;
 	t->priv_free = cortexm_priv_free;
 	priv->ap = ap;
@@ -280,6 +288,20 @@ bool cortexm_probe(ADIv5_AP_t *ap)
 	t->mem_write = cortexm_mem_write;
 
 	t->driver = cortexm_driver_str;
+	switch (identity) {
+	case 0x11: /* M3/M4 */
+		t->core = "M3/M4";
+		break;
+	case 0x21: /* M0 */
+		t->core = "M0";
+		break;
+	case 0x31: /* M0+ */
+		t->core = "M0+";
+		break;
+	case 0x01: /* M7 */
+		t->core = "M7";
+		break;
+	}
 
 	t->attach = cortexm_attach;
 	t->detach = cortexm_detach;
@@ -288,6 +310,8 @@ bool cortexm_probe(ADIv5_AP_t *ap)
 	t->tdesc = tdesc_cortex_m;
 	t->regs_read = cortexm_regs_read;
 	t->regs_write = cortexm_regs_write;
+	t->reg_read = cortexm_reg_read;
+	t->reg_write = cortexm_reg_write;
 
 	t->reset = cortexm_reset;
 	t->halt_request = cortexm_halt_request;
@@ -323,8 +347,14 @@ bool cortexm_probe(ADIv5_AP_t *ap)
 		target_check_error(t);
 	}
 
-	if (!cortexm_forced_halt(t))
-		return false;
+	/* Only force halt if read ROM Table failed and there is no DPv2
+	 * targetid!
+	 * So long, only STM32L0 is expected to enter this cause.
+	 */
+	if (forced && !ap->dp->targetid)
+		if (!cortexm_forced_halt(t))
+			return false;
+
 #define PROBE(x) \
 	do { if ((x)(t)) {target_halt_resume(t, 0); return true;} else target_check_error(t); } while (0)
 
@@ -344,6 +374,7 @@ bool cortexm_probe(ADIv5_AP_t *ap)
 	PROBE(kinetis_probe);
 	PROBE(efm32_probe);
 	PROBE(msp432_probe);
+	PROBE(ke04_probe);
 	PROBE(lpc17xx_probe);
 #undef PROBE
 
@@ -414,16 +445,28 @@ void cortexm_detach(target *t)
 
 	/* Disable debug */
 	target_mem_write32(t, CORTEXM_DHCSR, CORTEXM_DHCSR_DBGKEY);
+	/* Add some clock cycles to get the CPU running again.*/
+	target_mem_read32(t, 0);
 }
 
 enum { DB_DHCSR, DB_DCRSR, DB_DCRDR, DB_DEMCR };
 
 static void cortexm_regs_read(target *t, void *data)
 {
-	ADIv5_AP_t *ap = cortexm_ap(t);
 	uint32_t *regs = data;
+	ADIv5_AP_t *ap = cortexm_ap(t);
 	unsigned i;
-
+#if defined(STLINKV2)
+	uint32_t base_regs[21];
+	extern void stlink_regs_read(ADIv5_AP_t *ap, void *data);
+	extern uint32_t stlink_reg_read(ADIv5_AP_t *ap, int idx);
+	stlink_regs_read(ap, base_regs);
+	for(i = 0; i < sizeof(regnum_cortex_m) / 4; i++)
+		*regs++ = base_regs[regnum_cortex_m[i]];
+	if (t->target_options & TOPT_FLAVOUR_V7MF)
+		for(size_t t = 0; t < sizeof(regnum_cortex_mf) / 4; t++)
+			*regs++ = stlink_reg_read(ap, regnum_cortex_mf[t]);
+#else
 	/* FIXME: Describe what's really going on here */
 	adiv5_ap_write(ap, ADIV5_AP_CSW, ap->csw | ADIV5_AP_CSW_SIZE_WORD);
 
@@ -447,12 +490,25 @@ static void cortexm_regs_read(target *t, void *data)
 			                    regnum_cortex_mf[i]);
 			*regs++ = adiv5_dp_read(ap->dp, ADIV5_AP_DB(DB_DCRDR));
 		}
+#endif
 }
 
 static void cortexm_regs_write(target *t, const void *data)
 {
-	ADIv5_AP_t *ap = cortexm_ap(t);
 	const uint32_t *regs = data;
+	ADIv5_AP_t *ap = cortexm_ap(t);
+#if defined(STLINKV2)
+	extern void stlink_reg_write(ADIv5_AP_t *ap, int num, uint32_t val);
+	for(size_t z = 0; z < sizeof(regnum_cortex_m) / 4; z++) {
+		stlink_reg_write(ap, regnum_cortex_m[z], *regs);
+		regs++;
+	}
+	if (t->target_options & TOPT_FLAVOUR_V7MF)
+		for(size_t z = 0; z < sizeof(regnum_cortex_mf) / 4; z++) {
+			stlink_reg_write(ap, regnum_cortex_mf[z], *regs);
+			regs++;
+	}
+#else
 	unsigned i;
 
 	/* FIXME: Describe what's really going on here */
@@ -481,6 +537,7 @@ static void cortexm_regs_write(target *t, const void *data)
 			                    ADIV5_AP_DB(DB_DCRSR),
 			                    0x10000 | regnum_cortex_mf[i]);
 		}
+#endif
 }
 
 int cortexm_mem_write_sized(
@@ -489,6 +546,39 @@ int cortexm_mem_write_sized(
 	cortexm_cache_clean(t, dest, len, true);
 	adiv5_mem_write_sized(cortexm_ap(t), dest, src, len, align);
 	return target_check_error(t);
+}
+
+int dcrsr_regnum(target *t, unsigned reg)
+{
+	if (reg < sizeof(regnum_cortex_m) / 4) {
+		return regnum_cortex_m[reg];
+	} else if ((t->target_options & TOPT_FLAVOUR_V7MF) &&
+	           (reg < (sizeof(regnum_cortex_m) +
+	                   sizeof(regnum_cortex_mf) / 4))) {
+		return regnum_cortex_mf[reg - sizeof(regnum_cortex_m)/4];
+	} else {
+		return -1;
+	}
+}
+ssize_t cortexm_reg_read(target *t, int reg, void *data, size_t max)
+{
+	if (max < 4)
+		return -1;
+	uint32_t *r = data;
+	target_mem_write32(t, CORTEXM_DCRSR, dcrsr_regnum(t, reg));
+	*r = target_mem_read32(t, CORTEXM_DCRDR);
+	return 4;
+}
+
+ssize_t cortexm_reg_write(target *t, int reg, const void *data, size_t max)
+{
+	if (max < 4)
+		return -1;
+	const uint32_t *r = data;
+	target_mem_write32(t, CORTEXM_DCRDR, *r);
+	target_mem_write32(t, CORTEXM_DCRSR, CORTEXM_DCRSR_REGWnR |
+	                                     dcrsr_regnum(t, reg));
+	return 4;
 }
 
 static uint32_t cortexm_pc_read(target *t)
@@ -532,6 +622,11 @@ static void cortexm_reset(target *t)
 
 	/* Reset DFSR flags */
 	target_mem_write32(t, CORTEXM_DFSR, CORTEXM_DFSR_RESETALL);
+
+	/* 1ms delay to ensure that things such as the stm32f1 HSI clock have started
+	 * up fully.
+	 */
+	platform_delay(1);
 }
 
 static void cortexm_halt_request(target *t)
@@ -866,7 +961,7 @@ static bool cortexm_vector_catch(target *t, int argc, char *argv[])
 	uint32_t tmp = 0;
 	unsigned i;
 
-	if ((argc < 3) || ((argv[1][0] != 'e') && (argv[1][0] != 'd'))) {
+	if (argc < 3) {
 		tc_printf(t, "usage: monitor vector_catch (enable|disable) "
 			     "(hard|int|bus|stat|chk|nocp|mm|reset)\n");
 	} else {
@@ -876,12 +971,16 @@ static bool cortexm_vector_catch(target *t, int argc, char *argv[])
 					tmp |= 1 << i;
 			}
 
-		if (argv[1][0] == 'e')
-			priv->demcr |= tmp;
-		else
-			priv->demcr &= ~tmp;
+		bool enable;
+		if (parse_enable_or_disable(argv[1], &enable)) {
+			if (enable) {
+				priv->demcr |= tmp;
+			} else {
+				priv->demcr &= ~tmp;
+			}
 
-		target_mem_write32(t, CORTEXM_DEMCR, priv->demcr);
+			target_mem_write32(t, CORTEXM_DEMCR, priv->demcr);
+		}
 	}
 
 	tc_printf(t, "Catching vectors: ");
@@ -1022,4 +1121,3 @@ static int cortexm_hostio_request(target *t)
 
 	return t->tc->interrupted;
 }
-

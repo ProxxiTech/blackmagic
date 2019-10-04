@@ -92,6 +92,8 @@ struct target_s {
 	const char *tdesc;
 	void (*regs_read)(target *t, void *data);
 	void (*regs_write)(target *t, const void *data);
+	ssize_t (*reg_read)(target *t, int reg, void *data, size_t max);
+	ssize_t (*reg_write)(target *t, int reg, const void *data, size_t size);
 
 	/* Halt/resume functions */
 	void (*reset)(target *t);
@@ -108,12 +110,14 @@ struct target_s {
 	/* target-defined options */
 	unsigned target_options;
 	uint32_t idcode;
+	uint32_t target_storage;
 
 	struct target_ram *ram;
 	struct target_flash *flash;
 
 	/* Other stuff */
 	const char *driver;
+	const char *core;
 	struct target_command_s *commands;
 
 	struct target_s *next;
@@ -177,5 +181,5 @@ bool samd_probe(target *t);
 bool kinetis_probe(target *t);
 bool efm32_probe(target *t);
 bool msp432_probe(target *t);
-
+bool ke04_probe(target *t);
 #endif

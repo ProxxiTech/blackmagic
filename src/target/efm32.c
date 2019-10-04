@@ -53,9 +53,9 @@ static const uint16_t efm32_flash_write_stub[] = {
 #include "flashstub/efm32.stub"
 };
 
-static bool efm32_cmd_erase_all(target *t);
-static bool efm32_cmd_serial(target *t);
-static bool efm32_cmd_efm_info(target *t);
+static bool efm32_cmd_erase_all(target *t, int argc, const char **argv);
+static bool efm32_cmd_serial(target *t, int argc, const char **argv);
+static bool efm32_cmd_efm_info(target *t, int argc, const char **argv);
 
 const struct command_s efm32_cmd_list[] = {
 	{"erase_mass", (cmd_handler)efm32_cmd_erase_all, "Erase entire flash memory"},
@@ -518,6 +518,11 @@ static void efm32_add_flash(target *t, target_addr addr, size_t length,
 			    size_t page_size)
 {
 	struct target_flash *f = calloc(1, sizeof(*f));
+	if (!f) {			/* calloc failed: heap exhaustion */
+		DEBUG("calloc: failed in %s\n", __func__);
+		return;
+	}
+
 	f->start = addr;
 	f->length = length;
 	f->blocksize = page_size;
@@ -563,7 +568,7 @@ bool efm32_probe(target *t)
 	ADIv5_AP_t *ap = cortexm_ap(t);
 	uint32_t ap_idcode = ap->dp->idcode;
 
-	/* Check the idcode is silabs. See AN0062 Section 2.2 */
+	/* Check the idcode. See AN0062 Section 2.2 */
 	if (ap_idcode == 0x2BA01477) {
 		/* Cortex M3, Cortex M4 */
 	} else if (ap_idcode == 0x0BC11477) {
@@ -572,32 +577,32 @@ bool efm32_probe(target *t)
 		return false;
 	}
 
-	/* Check the EUI is silabs. Identify the Device Identification (DI) version */
-	if (((efm32_v1_read_eui64(t) >> 40) & 0xFFFFFF) == EFM32_V1_DI_EUI_SILABS) {
+	/* Check the OUI in the EUI is silabs or energymicro.
+	 * Use this to identify the Device Identification (DI) version */
+	uint64_t oui24 = ((efm32_v1_read_eui64(t) >> 40) & 0xFFFFFF);
+	if (oui24 == EFM32_V1_DI_EUI_SILABS) {
 		/* Device Identification (DI) version 1 */
 		di_version = 1;
-	} else if (((efm32_v2_read_eui48(t) >> 24) & 0xFFFFFF) == EFM32_V2_DI_EUI_ENERGYMICRO) {
+	} else if (oui24 == EFM32_V2_DI_EUI_ENERGYMICRO) {
 		/* Device Identification (DI) version 2 */
 		di_version = 2;
 	} else {
-		/* unknown device */
-		/* sprintf(variant_string, */
-		/* 		"EFM32 DI Version ?? 0x%016llx 0x%016llx", */
-		/* 		efm32_v1_read_eui64(t), efm32_v2_read_eui48(t)); */
-		return false;
+		/* Unknown OUI - assume version 1 */
+		di_version = 1;
 	}
 
-	/* Read the part number and family */
-	uint16_t part_number = efm32_read_part_number(t, di_version);
+	/* Read the part family, and reject if unknown */
 	size_t device_index  = efm32_lookup_device_index(t, di_version);
 	if (device_index > (127-32)) {
-		/* too big to encode in printable ascii */
+		/* unknown device family */
 		return false;
 	}
 	efm32_device_t const* device = &efm32_devices[device_index];
 	if (device == NULL) {
 		return false;
 	}
+
+	uint16_t part_number = efm32_read_part_number(t, di_version);
 
 	/* Read memory sizes, convert to bytes */
 	uint16_t flash_kib  = efm32_read_flash_size(t, di_version);
@@ -606,7 +611,7 @@ bool efm32_probe(target *t)
 	uint32_t ram_size   = ram_kib   * 0x400;
 	uint32_t flash_page_size = device->flash_page_size;
 
-	sprintf(variant_string, "%c\b%c\b%s %d F%d %s",
+	snprintf(variant_string, sizeof(variant_string), "%c\b%c\b%s %d F%d %s",
 			di_version + 48, (uint8_t)device_index + 32,
 			device->name, part_number, flash_kib, device->description);
 
@@ -693,8 +698,10 @@ static int efm32_flash_write(struct target_flash *f,
 /**
  * Uses the MSC ERASEMAIN0 command to erase the entire flash
  */
-static bool efm32_cmd_erase_all(target *t)
+static bool efm32_cmd_erase_all(target *t, int argc, const char **argv)
 {
+	(void)argc;
+	(void)argv;
 	efm32_device_t const* device = efm32_get_device(t->driver[2] - 32);
 	if (device == NULL) {
 		return true;
@@ -727,8 +734,10 @@ static bool efm32_cmd_erase_all(target *t)
 /**
  * Reads the 40-bit unique number
  */
-static bool efm32_cmd_serial(target *t)
+static bool efm32_cmd_serial(target *t, int argc, const char **argv)
 {
+	(void)argc;
+	(void)argv;
 	uint64_t unique = 0;
 	uint8_t di_version = t->driver[0] - 48; /* di version hidden in driver str */
 
@@ -750,8 +759,10 @@ static bool efm32_cmd_serial(target *t)
 /**
  * Prints various information we know about the device
  */
-static bool efm32_cmd_efm_info(target *t)
+static bool efm32_cmd_efm_info(target *t, int argc, const char **argv)
 {
+	(void)argc;
+	(void)argv;
 	uint8_t di_version  = t->driver[0] - 48; /* hidden in driver str */
 
 	switch (di_version) {

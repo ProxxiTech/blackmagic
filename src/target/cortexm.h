@@ -144,10 +144,12 @@ extern long cortexm_wait_timeout;
 #define CORTEXM_FPB_CTRL_KEY		(1 << 1)
 #define CORTEXM_FPB_CTRL_ENABLE		(1 << 0)
 
-/* Data Watchpoint and Trace Mask Register (DWT_MASKx) */
-#define CORTEXM_DWT_MASK_BYTE		(0 << 0)
-#define CORTEXM_DWT_MASK_HALFWORD	(1 << 0)
-#define CORTEXM_DWT_MASK_WORD		(3 << 0)
+/* Data Watchpoint and Trace Mask Register (DWT_MASKx)
+*  The value here is the number of address bits we mask out */
+#define CORTEXM_DWT_MASK_BYTE		(0)
+#define CORTEXM_DWT_MASK_HALFWORD	(1)
+#define CORTEXM_DWT_MASK_WORD		(2)
+#define CORTEXM_DWT_MASK_DWORD		(3)
 
 /* Data Watchpoint and Trace Function Register (DWT_FUNCTIONx) */
 #define CORTEXM_DWT_FUNC_MATCHED	(1 << 24)
@@ -168,7 +170,7 @@ extern long cortexm_wait_timeout;
 
 #define	CORTEXM_TOPT_INHIBIT_SRST (1 << 2)
 
-bool cortexm_probe(ADIv5_AP_t *ap);
+bool cortexm_probe(ADIv5_AP_t *ap, bool forced);
 ADIv5_AP_t *cortexm_ap(target *t);
 
 bool cortexm_attach(target *t);
